@@ -24,7 +24,7 @@ Example:
     }
 
 */
-package inotify // import "golang.org/x/exp/inotify"
+package inotify // import "github.com/jhenstridge/go-inotify"
 
 import (
 	"errors"
