@@ -37,15 +37,17 @@ import (
 )
 
 type Event struct {
-	Mask   uint32 // Mask of events
+	Mask   Mask // Mask of events
 	Cookie uint32 // Unique cookie associating related events (for rename(2))
 	Name   string // File name (optional)
 }
 
 type watch struct {
 	wd    uint32 // Watch descriptor (as returned by the inotify_add_watch() syscall)
-	flags uint32 // inotify flags of this watch (see inotify(7) for the list of valid flags)
+	flags Mask // inotify flags of this watch (see inotify(7) for the list of valid flags)
 }
+
+type Mask uint32
 
 type Watcher struct {
 	mu       sync.Mutex
@@ -97,7 +99,7 @@ func (w *Watcher) Close() error {
 
 // AddWatch adds path to the watched file set.
 // The flags are interpreted as described in inotify_add_watch(2).
-func (w *Watcher) AddWatch(path string, flags uint32) error {
+func (w *Watcher) AddWatch(path string, flags Mask) error {
 	if w.isClosed {
 		return errors.New("inotify instance already closed")
 	}
@@ -110,7 +112,7 @@ func (w *Watcher) AddWatch(path string, flags uint32) error {
 
 	w.mu.Lock() // synchronize with readEvents goroutine
 
-	wd, err := syscall.InotifyAddWatch(w.fd, path, flags)
+	wd, err := syscall.InotifyAddWatch(w.fd, path, uint32(flags))
 	if err != nil {
 		w.mu.Unlock()
 		return &os.PathError{
@@ -193,8 +195,8 @@ func (w *Watcher) readEvents() {
 			// Point "raw" to the event in the buffer
 			raw := (*syscall.InotifyEvent)(unsafe.Pointer(&buf[offset]))
 			event := new(Event)
-			event.Mask = uint32(raw.Mask)
-			event.Cookie = uint32(raw.Cookie)
+			event.Mask = Mask(raw.Mask)
+			event.Cookie = raw.Cookie
 			nameLen := uint32(raw.Len)
 			// If the event happened to the watched directory or the watched file, the kernel
 			// doesn't append the filename to the event, but we would like to always fill the
@@ -245,44 +247,44 @@ func (e *Event) String() string {
 
 const (
 	// Options for inotify_init() are not exported
-	// IN_CLOEXEC    uint32 = syscall.IN_CLOEXEC
-	// IN_NONBLOCK   uint32 = syscall.IN_NONBLOCK
+	// IN_CLOEXEC    Mask = syscall.IN_CLOEXEC
+	// IN_NONBLOCK   Mask = syscall.IN_NONBLOCK
 
 	// Options for AddWatch
-	IN_DONT_FOLLOW uint32 = syscall.IN_DONT_FOLLOW
-	IN_ONESHOT     uint32 = syscall.IN_ONESHOT
-	IN_ONLYDIR     uint32 = syscall.IN_ONLYDIR
+	IN_DONT_FOLLOW Mask = syscall.IN_DONT_FOLLOW
+	IN_ONESHOT     Mask = syscall.IN_ONESHOT
+	IN_ONLYDIR     Mask = syscall.IN_ONLYDIR
 
 	// The "IN_MASK_ADD" option is not exported, as AddWatch
 	// adds it automatically, if there is already a watch for the given path
-	// IN_MASK_ADD      uint32 = syscall.IN_MASK_ADD
+	// IN_MASK_ADD      Mask = syscall.IN_MASK_ADD
 
 	// Events
-	IN_ACCESS        uint32 = syscall.IN_ACCESS
-	IN_ALL_EVENTS    uint32 = syscall.IN_ALL_EVENTS
-	IN_ATTRIB        uint32 = syscall.IN_ATTRIB
-	IN_CLOSE         uint32 = syscall.IN_CLOSE
-	IN_CLOSE_NOWRITE uint32 = syscall.IN_CLOSE_NOWRITE
-	IN_CLOSE_WRITE   uint32 = syscall.IN_CLOSE_WRITE
-	IN_CREATE        uint32 = syscall.IN_CREATE
-	IN_DELETE        uint32 = syscall.IN_DELETE
-	IN_DELETE_SELF   uint32 = syscall.IN_DELETE_SELF
-	IN_MODIFY        uint32 = syscall.IN_MODIFY
-	IN_MOVE          uint32 = syscall.IN_MOVE
-	IN_MOVED_FROM    uint32 = syscall.IN_MOVED_FROM
-	IN_MOVED_TO      uint32 = syscall.IN_MOVED_TO
-	IN_MOVE_SELF     uint32 = syscall.IN_MOVE_SELF
-	IN_OPEN          uint32 = syscall.IN_OPEN
+	IN_ACCESS        Mask = syscall.IN_ACCESS
+	IN_ALL_EVENTS    Mask = syscall.IN_ALL_EVENTS
+	IN_ATTRIB        Mask = syscall.IN_ATTRIB
+	IN_CLOSE         Mask = syscall.IN_CLOSE
+	IN_CLOSE_NOWRITE Mask = syscall.IN_CLOSE_NOWRITE
+	IN_CLOSE_WRITE   Mask = syscall.IN_CLOSE_WRITE
+	IN_CREATE        Mask = syscall.IN_CREATE
+	IN_DELETE        Mask = syscall.IN_DELETE
+	IN_DELETE_SELF   Mask = syscall.IN_DELETE_SELF
+	IN_MODIFY        Mask = syscall.IN_MODIFY
+	IN_MOVE          Mask = syscall.IN_MOVE
+	IN_MOVED_FROM    Mask = syscall.IN_MOVED_FROM
+	IN_MOVED_TO      Mask = syscall.IN_MOVED_TO
+	IN_MOVE_SELF     Mask = syscall.IN_MOVE_SELF
+	IN_OPEN          Mask = syscall.IN_OPEN
 
 	// Special events
-	IN_ISDIR      uint32 = syscall.IN_ISDIR
-	IN_IGNORED    uint32 = syscall.IN_IGNORED
-	IN_Q_OVERFLOW uint32 = syscall.IN_Q_OVERFLOW
-	IN_UNMOUNT    uint32 = syscall.IN_UNMOUNT
+	IN_ISDIR      Mask = syscall.IN_ISDIR
+	IN_IGNORED    Mask = syscall.IN_IGNORED
+	IN_Q_OVERFLOW Mask = syscall.IN_Q_OVERFLOW
+	IN_UNMOUNT    Mask = syscall.IN_UNMOUNT
 )
 
 var eventBits = []struct {
-	Value uint32
+	Value Mask
 	Name  string
 }{
 	{IN_ACCESS, "IN_ACCESS"},
