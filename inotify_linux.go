@@ -27,24 +27,31 @@ Example:
 package inotify // import "github.com/jhenstridge/go-inotify"
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
 )
 
+var (
+	ErrClosed       = errors.New("inotify instance already closed")
+	ErrInvalidWatch = errors.New("invalid inotify watch")
+)
+
 type Event struct {
-	Mask   Mask // Mask of events
+	Watch  *Watch // the watch associated with this event
+	Mask   Mask   // Mask of events
 	Cookie uint32 // Unique cookie associating related events (for rename(2))
 	Name   string // File name (optional)
 }
 
-type watch struct {
-	wd    uint32 // Watch descriptor (as returned by the inotify_add_watch() syscall)
-	flags Mask // inotify flags of this watch (see inotify(7) for the list of valid flags)
+type Watch struct {
+	wd   int32  // Watch descriptor (as returned by the inotify_add_watch() syscall)
+	Mask Mask   // inotify flags of this watch (see inotify(7) for the list of valid flags)
+	Path string // the path associated with this watch
 }
 
 type Mask uint32
@@ -52,8 +59,7 @@ type Mask uint32
 type Watcher struct {
 	mu       sync.Mutex
 	fd       int               // File descriptor (as returned by the inotify_init() syscall)
-	watches  map[string]*watch // Map of inotify watches (key: path)
-	paths    map[int]string    // Map of watched paths (key: watch descriptor)
+	watches  map[int32]*Watch // Map of inotify watches (key: wd)
 	Error    chan error        // Errors are sent on this channel
 	Event    chan *Event       // Events are returned on this channel
 	done     chan bool         // Channel for sending a "quit message" to the reader goroutine
@@ -68,8 +74,7 @@ func NewWatcher() (*Watcher, error) {
 	}
 	w := &Watcher{
 		fd:      fd,
-		watches: make(map[string]*watch),
-		paths:   make(map[int]string),
+		watches: make(map[int32]*Watch),
 		Event:   make(chan *Event),
 		Error:   make(chan error),
 		done:    make(chan bool, 1),
@@ -90,66 +95,75 @@ func (w *Watcher) Close() error {
 
 	// Send "quit" message to the reader goroutine
 	w.done <- true
-	for path := range w.watches {
-		w.RemoveWatch(path)
-	}
 
 	return nil
 }
 
 // AddWatch adds path to the watched file set.
-// The flags are interpreted as described in inotify_add_watch(2).
-func (w *Watcher) AddWatch(path string, flags Mask) error {
-	if w.isClosed {
-		return errors.New("inotify instance already closed")
-	}
-
-	watchEntry, found := w.watches[path]
-	if found {
-		watchEntry.flags |= flags
-		flags |= syscall.IN_MASK_ADD
-	}
-
+// The mask are interpreted as described in inotify_add_watch(2).
+func (w *Watcher) AddWatch(path string, mask Mask) (*Watch, error) {
 	w.mu.Lock() // synchronize with readEvents goroutine
+	defer w.mu.Unlock()
 
-	wd, err := syscall.InotifyAddWatch(w.fd, path, uint32(flags))
+	if w.isClosed {
+		return nil, ErrClosed
+	}
+
+
+	wd, err := syscall.InotifyAddWatch(w.fd, path, uint32(mask))
 	if err != nil {
-		w.mu.Unlock()
-		return &os.PathError{
+		return nil, &os.PathError{
 			Op:   "inotify_add_watch",
 			Path: path,
 			Err:  err,
 		}
 	}
 
-	if !found {
-		w.watches[path] = &watch{wd: uint32(wd), flags: flags}
-		w.paths[wd] = path
+	watch := w.watches[int32(wd)]
+	if watch == nil {
+		watch = &Watch{
+			wd: int32(wd),
+		}
+		w.watches[watch.wd] = watch
 	}
-	w.mu.Unlock()
-	return nil
+
+	newMask := mask & (IN_ALL_EVENTS | IN_DONT_FOLLOW | IN_EXCL_UNLINK)
+	if mask & IN_MASK_ADD != 0 {
+		newMask |= watch.Mask
+	}
+	watch.Mask = newMask
+	watch.Path = path
+
+	return watch, nil
 }
 
 // Watch adds path to the watched file set, watching all events.
-func (w *Watcher) Watch(path string) error {
+func (w *Watcher) Watch(path string) (*Watch, error) {
 	return w.AddWatch(path, IN_ALL_EVENTS)
 }
 
 // RemoveWatch removes path from the watched file set.
-func (w *Watcher) RemoveWatch(path string) error {
-	watch, ok := w.watches[path]
-	if !ok {
-		return errors.New(fmt.Sprintf("can't remove non-existent inotify watch for: %s", path))
-	}
-	success, errno := syscall.InotifyRmWatch(w.fd, watch.wd)
-	if success == -1 {
-		return os.NewSyscallError("inotify_rm_watch", errno)
-	}
-	delete(w.watches, path)
-	// Locking here to protect the read from paths in readEvents.
+func (w *Watcher) RemoveWatch(watch *Watch) error {
 	w.mu.Lock()
-	delete(w.paths, int(watch.wd))
-	w.mu.Unlock()
+	defer w.mu.Unlock()
+
+	if w.isClosed {
+		return ErrClosed
+	}
+	if watch.wd < 0 || w.watches[watch.wd] != watch {
+		return ErrInvalidWatch
+	}
+
+	_, err := syscall.InotifyRmWatch(w.fd, uint32(watch.wd))
+	if err != nil {
+		return os.NewSyscallError("inotify_rm_watch", err)
+	}
+
+	// We don't remove the watch from the watches map here, since
+	// pending events might still reference it. Instead, we give
+	// it an invalid watch ID so we can catch attempts to remove
+	// it twice.
+	watch.wd = -1
 	return nil
 }
 
@@ -188,36 +202,35 @@ func (w *Watcher) readEvents() {
 			continue
 		}
 
-		var offset uint32 = 0
+		offset := 0
 		// We don't know how many events we just read into the buffer
 		// While the offset points to at least one whole event...
-		for offset <= uint32(n-syscall.SizeofInotifyEvent) {
+		for offset + syscall.SizeofInotifyEvent <= n {
 			// Point "raw" to the event in the buffer
 			raw := (*syscall.InotifyEvent)(unsafe.Pointer(&buf[offset]))
+			offset += syscall.SizeofInotifyEvent
 			event := new(Event)
+			if raw.Wd >= 0 {
+				w.mu.Lock()
+				event.Watch = w.watches[raw.Wd]
+				w.mu.Unlock()
+			}
 			event.Mask = Mask(raw.Mask)
 			event.Cookie = raw.Cookie
-			nameLen := uint32(raw.Len)
-			// If the event happened to the watched directory or the watched file, the kernel
-			// doesn't append the filename to the event, but we would like to always fill the
-			// the "Name" field with a valid filename. We retrieve the path of the watch from
-			// the "paths" map.
-			w.mu.Lock()
-			name, ok := w.paths[int(raw.Wd)]
-			w.mu.Unlock()
-			if ok {
-				event.Name = name
-				if nameLen > 0 {
-					// Point "bytes" at the first byte of the filename
-					bytes := (*[syscall.PathMax]byte)(unsafe.Pointer(&buf[offset+syscall.SizeofInotifyEvent]))
-					// The filename is padded with NUL bytes. TrimRight() gets rid of those.
-					event.Name += "/" + strings.TrimRight(string(bytes[0:nameLen]), "\000")
-				}
-				// Send the event on the events channel
-				w.Event <- event
+			if raw.Len != 0 {
+				event.Name = string(bytes.TrimRight(buf[offset:offset + int(raw.Len)], "\x00"))
 			}
-			// Move to the next event in the buffer
-			offset += syscall.SizeofInotifyEvent + nameLen
+			offset += int(raw.Len)
+			// Send the event on the events channel
+			w.Event <- event
+
+			// Forget the watch if the kernel says it has been removed
+			if event.Mask & IN_IGNORED != 0 && event.Watch != nil {
+				w.mu.Lock()
+				delete(w.watches, event.Watch.wd)
+				event.Watch.wd = -1
+				w.mu.Unlock()
+			}
 		}
 	}
 }
@@ -252,12 +265,11 @@ const (
 
 	// Options for AddWatch
 	IN_DONT_FOLLOW Mask = syscall.IN_DONT_FOLLOW
+	IN_EXCL_UNLINK Mask = syscall.IN_EXCL_UNLINK
 	IN_ONESHOT     Mask = syscall.IN_ONESHOT
 	IN_ONLYDIR     Mask = syscall.IN_ONLYDIR
 
-	// The "IN_MASK_ADD" option is not exported, as AddWatch
-	// adds it automatically, if there is already a watch for the given path
-	// IN_MASK_ADD      Mask = syscall.IN_MASK_ADD
+	IN_MASK_ADD      Mask = syscall.IN_MASK_ADD
 
 	// Events
 	IN_ACCESS        Mask = syscall.IN_ACCESS

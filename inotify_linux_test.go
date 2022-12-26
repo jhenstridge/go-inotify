@@ -28,9 +28,12 @@ func TestInotifyEvents(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	// Add a watch for "_test"
-	err = watcher.Watch(dir)
+	watch, err := watcher.Watch(dir)
 	if err != nil {
 		t.Fatalf("Watch failed: %s", err)
+	}
+	if watch == nil {
+		t.Fatalf("Watch returned a nil watch")
 	}
 
 	// Receive errors on the error channel on a separate goroutine
@@ -49,7 +52,7 @@ func TestInotifyEvents(t *testing.T) {
 	go func() {
 		for event := range eventstream {
 			// Only count relevant events
-			if event.Name == testFile {
+			if event.Watch == watch && event.Name == "TestInotifyEvents.testfile" {
 				atomic.AddInt32(&eventsReceived, 1)
 				t.Logf("event received: %s", event)
 			} else {
@@ -100,7 +103,7 @@ func TestInotifyClose(t *testing.T) {
 		t.Fatal("double Close() test failed: second Close() call didn't return")
 	}
 
-	err := watcher.Watch(os.TempDir())
+	_, err := watcher.Watch(os.TempDir())
 	if err == nil {
 		t.Fatal("expected error on Watch() after Close(), got nil")
 	}
