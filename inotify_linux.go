@@ -30,6 +30,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"syscall"
@@ -58,26 +59,28 @@ type Mask uint32
 
 type Watcher struct {
 	mu       sync.Mutex
-	fd       int               // File descriptor (as returned by the inotify_init() syscall)
+	fd       int              // File descriptor (as returned by the inotify_init() syscall)
+	f        *os.File         // A os.File for the above file descriptor
 	watches  map[int32]*Watch // Map of inotify watches (key: wd)
-	Error    chan error        // Errors are sent on this channel
-	Event    chan *Event       // Events are returned on this channel
-	done     chan bool         // Channel for sending a "quit message" to the reader goroutine
-	isClosed bool              // Set to true when Close() is first called
+	error    chan error       // Errors are sent on this channel
+	Event    chan Event       // Events are returned on this channel
+	done     chan struct{}    // Channel for sending a "quit message" to the reader goroutine
+	isClosed bool             // Set to true when Close() is first called
 }
 
 // NewWatcher creates and returns a new inotify instance using inotify_init(2)
 func NewWatcher() (*Watcher, error) {
-	fd, errno := syscall.InotifyInit()
+	fd, errno := syscall.InotifyInit1(syscall.IN_CLOEXEC | syscall.IN_NONBLOCK)
 	if fd == -1 {
 		return nil, os.NewSyscallError("inotify_init", errno)
 	}
 	w := &Watcher{
 		fd:      fd,
+		f:       os.NewFile(uintptr(fd), ""),
 		watches: make(map[int32]*Watch),
-		Event:   make(chan *Event),
-		Error:   make(chan error),
-		done:    make(chan bool, 1),
+		Event:   make(chan Event),
+		error:   make(chan error, 1),
+		done:    make(chan struct{}),
 	}
 
 	go w.readEvents()
@@ -88,19 +91,29 @@ func NewWatcher() (*Watcher, error) {
 // It sends a message to the reader goroutine to quit and removes all watches
 // associated with the inotify instance
 func (w *Watcher) Close() error {
-	if w.isClosed {
-		return nil
+	w.mu.Lock()
+	if !w.isClosed {
+		// Send "quit" message to the reader goroutine
+		close(w.done)
+		w.f.Close()
 	}
 	w.isClosed = true
 
-	// Send "quit" message to the reader goroutine
-	w.done <- true
-
-	return nil
+	w.mu.Unlock()
+	return <-w.error
 }
 
 // AddWatch adds path to the watched file set.
 // The mask are interpreted as described in inotify_add_watch(2).
+//
+// If a watch already exists for the path's inode, a number of things
+// could happen:
+//
+//   1. If the mask includes IN_MASK_CREATE, an error will be returned.
+//   2. If the mask includes IN_MASK_ADD, the new mask bits will be
+//      combined with the old.
+//   3. Otherwise, the old mask will be replaced with the new one.
+
 func (w *Watcher) AddWatch(path string, mask Mask) (*Watch, error) {
 	w.mu.Lock() // synchronize with readEvents goroutine
 	defer w.mu.Unlock()
@@ -108,7 +121,6 @@ func (w *Watcher) AddWatch(path string, mask Mask) (*Watch, error) {
 	if w.isClosed {
 		return nil, ErrClosed
 	}
-
 
 	wd, err := syscall.InotifyAddWatch(w.fd, path, uint32(mask))
 	if err != nil {
@@ -128,7 +140,7 @@ func (w *Watcher) AddWatch(path string, mask Mask) (*Watch, error) {
 	}
 
 	newMask := mask & (IN_ALL_EVENTS | IN_DONT_FOLLOW | IN_EXCL_UNLINK)
-	if mask & IN_MASK_ADD != 0 {
+	if mask&IN_MASK_ADD != 0 {
 		newMask |= watch.Mask
 	}
 	watch.Mask = newMask
@@ -167,77 +179,83 @@ func (w *Watcher) RemoveWatch(watch *Watch) error {
 	return nil
 }
 
+func (w *Watcher) decodeEvents(events []Event, buf []byte) []Event {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	offset := 0
+	// We don't know how many events we just read into the buffer
+	// While the offset points to at least one whole event...
+	for offset+syscall.SizeofInotifyEvent <= len(buf) {
+		// Point "raw" to the event in the buffer
+		raw := (*syscall.InotifyEvent)(unsafe.Pointer(&buf[offset]))
+		offset += syscall.SizeofInotifyEvent
+
+		var watch *Watch
+		if raw.Wd >= 0 {
+			watch = w.watches[raw.Wd]
+		}
+		var name string
+		if raw.Len != 0 {
+			name = string(bytes.TrimRight(buf[offset:offset+int(raw.Len)], "\x00"))
+		}
+		offset += int(raw.Len)
+
+		events = append(events, Event{
+			Watch:  watch,
+			Mask:   Mask(raw.Mask),
+			Cookie: raw.Cookie,
+			Name:   name,
+		})
+
+		if raw.Mask&syscall.IN_IGNORED != 0 && watch != nil {
+			delete(w.watches, watch.wd)
+			watch.wd = -1
+		}
+	}
+	return events
+}
+
 // readEvents reads from the inotify file descriptor, converts the
 // received events into Event objects and sends them via the Event channel
 func (w *Watcher) readEvents() {
-	var buf [syscall.SizeofInotifyEvent * 4096]byte
+	var (
+		buf    [4096]byte
+		events []Event
+		retErr error
+	)
+	defer func() {
+		w.error <- retErr
+		close(w.error)
+		close(w.Event)
+	}()
 
 	for {
-		n, err := syscall.Read(w.fd, buf[:])
-		// See if there is a message on the "done" channel
-		var done bool
-		select {
-		case done = <-w.done:
-		default:
+		n, err := w.f.Read(buf[:])
+
+		if n > 0 {
+			events = w.decodeEvents(events[:0], buf[:n])
+			for i := range events {
+				select {
+				case w.Event <- events[i]:
+				case <-w.done:
+					return
+				}
+			}
 		}
 
-		// If EOF or a "done" message is received
-		if n == 0 || done {
-			// The syscall.Close can be slow.  Close
-			// w.Event first.
-			close(w.Event)
-			err := syscall.Close(w.fd)
-			if err != nil {
-				w.Error <- os.NewSyscallError("close", err)
+		if err != nil {
+			if err != io.EOF && !errors.Is(err, os.ErrClosed) {
+				retErr = err
 			}
-			close(w.Error)
 			return
-		}
-		if n < 0 {
-			w.Error <- os.NewSyscallError("read", err)
-			continue
-		}
-		if n < syscall.SizeofInotifyEvent {
-			w.Error <- errors.New("inotify: short read in readEvents()")
-			continue
-		}
-
-		offset := 0
-		// We don't know how many events we just read into the buffer
-		// While the offset points to at least one whole event...
-		for offset + syscall.SizeofInotifyEvent <= n {
-			// Point "raw" to the event in the buffer
-			raw := (*syscall.InotifyEvent)(unsafe.Pointer(&buf[offset]))
-			offset += syscall.SizeofInotifyEvent
-			event := new(Event)
-			if raw.Wd >= 0 {
-				w.mu.Lock()
-				event.Watch = w.watches[raw.Wd]
-				w.mu.Unlock()
-			}
-			event.Mask = Mask(raw.Mask)
-			event.Cookie = raw.Cookie
-			if raw.Len != 0 {
-				event.Name = string(bytes.TrimRight(buf[offset:offset + int(raw.Len)], "\x00"))
-			}
-			offset += int(raw.Len)
-			// Send the event on the events channel
-			w.Event <- event
-
-			// Forget the watch if the kernel says it has been removed
-			if event.Mask & IN_IGNORED != 0 && event.Watch != nil {
-				w.mu.Lock()
-				delete(w.watches, event.Watch.wd)
-				event.Watch.wd = -1
-				w.mu.Unlock()
-			}
 		}
 	}
 }
 
 // String formats the event e in the form
 // "filename: 0xEventMask = IN_ACCESS|IN_ATTRIB_|..."
-func (e *Event) String() string {
+func (e Event) String() string {
 	var events string = ""
 
 	m := e.Mask
@@ -269,7 +287,7 @@ const (
 	IN_ONESHOT     Mask = syscall.IN_ONESHOT
 	IN_ONLYDIR     Mask = syscall.IN_ONLYDIR
 
-	IN_MASK_ADD      Mask = syscall.IN_MASK_ADD
+	IN_MASK_ADD Mask = syscall.IN_MASK_ADD
 
 	// Events
 	IN_ACCESS        Mask = syscall.IN_ACCESS

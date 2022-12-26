@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build linux
 // +build linux
 
 package inotify
@@ -35,13 +36,6 @@ func TestInotifyEvents(t *testing.T) {
 	if watch == nil {
 		t.Fatalf("Watch returned a nil watch")
 	}
-
-	// Receive errors on the error channel on a separate goroutine
-	go func() {
-		for err := range watcher.Error {
-			t.Fatalf("error received: %s", err)
-		}
-	}()
 
 	testFile := dir + "/TestInotifyEvents.testfile"
 
@@ -77,7 +71,10 @@ func TestInotifyEvents(t *testing.T) {
 
 	// Try closing the inotify instance
 	t.Log("calling Close()")
-	watcher.Close()
+	err = watcher.Close()
+	if err != nil {
+		t.Fatalf("error closing watcher: %s", err)
+	}
 	t.Log("waiting for the event channel to become closed...")
 	select {
 	case <-done:
