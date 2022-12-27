@@ -34,3 +34,18 @@ problems:
    `*os.File`. This should take advantage of the Go runtime's IO
    polling system and stop the `readEvents` goroutine from tieing up
    an OS thread.
+
+There is still a potential concurrency issue with the approach I've taken. Imagine this sequence of events:
+
+1. user calls `RemoveWatch` for watch descriptor N
+2. the `Read` call in the `readEvents` goroutine returns with events for watch descriptor N
+3. user calls `AddWatch`, which happens to reuse watch descriptor N
+4. the `readEvents` goroutine acquires the lock to decode the events it received
+
+With this sequence of events, it would be unclear which watch the
+event belonged to. According to [this LKML post][1], watch descriptors
+are allocated sequentially, and can only be reused after they wrap at
+`INT_MAX`. So this is unlikely to be a problem in practice.
+
+
+[1]: https://lore.kernel.org/lkml/20140609151639.13db5634@flatline.rdu.redhat.com/
