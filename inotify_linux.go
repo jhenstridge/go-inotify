@@ -6,23 +6,19 @@
 Package inotify implements a wrapper for the Linux inotify system.
 
 Example:
-    watcher, err := inotify.NewWatcher()
-    if err != nil {
-        log.Fatal(err)
-    }
-    err = watcher.Watch("/tmp")
-    if err != nil {
-        log.Fatal(err)
-    }
-    for {
-        select {
-        case ev := <-watcher.Event:
-            log.Println("event:", ev)
-        case err := <-watcher.Error:
-            log.Println("error:", err)
-        }
-    }
 
+	watcher, err := inotify.NewWatcher()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer watcher.Close()
+	_, err = watcher.Watch("/tmp")
+	if err != nil {
+		log.Fatal(err)
+	}
+	for ev := range watcher.Event {
+		log.Println("event:", ev)
+	}
 */
 package inotify // import "github.com/jhenstridge/go-inotify"
 
@@ -256,24 +252,28 @@ func (w *Watcher) readEvents() {
 // String formats the event e in the form
 // "filename: 0xEventMask = IN_ACCESS|IN_ATTRIB_|..."
 func (e Event) String() string {
-	var events string = ""
+	var path string
+	if e.Watch != nil {
+		path = e.Watch.Path
+	}
+	return fmt.Sprintf("path=%q mask=%#x (%s) name=%q", path, uint32(e.Mask), e.Mask, e.Name)
+}
 
-	m := e.Mask
+func (m Mask) String() string {
+	events := ""
 	for _, b := range eventBits {
 		if m&b.Value == b.Value {
 			m &^= b.Value
 			events += "|" + b.Name
 		}
 	}
-
 	if m != 0 {
 		events += fmt.Sprintf("|%#x", m)
 	}
 	if len(events) > 0 {
-		events = " == " + events[1:]
+		return events[1:]
 	}
-
-	return fmt.Sprintf("%q: %#x%s", e.Name, e.Mask, events)
+	return "0"
 }
 
 const (
@@ -284,10 +284,11 @@ const (
 	// Options for AddWatch
 	IN_DONT_FOLLOW Mask = syscall.IN_DONT_FOLLOW
 	IN_EXCL_UNLINK Mask = syscall.IN_EXCL_UNLINK
+	IN_ISDIR       Mask = syscall.IN_ISDIR
+	IN_MASK_ADD    Mask = syscall.IN_MASK_ADD
+	IN_MASK_CREATE Mask = 0x10000000
 	IN_ONESHOT     Mask = syscall.IN_ONESHOT
 	IN_ONLYDIR     Mask = syscall.IN_ONLYDIR
-
-	IN_MASK_ADD Mask = syscall.IN_MASK_ADD
 
 	// Events
 	IN_ACCESS        Mask = syscall.IN_ACCESS
@@ -307,7 +308,6 @@ const (
 	IN_OPEN          Mask = syscall.IN_OPEN
 
 	// Special events
-	IN_ISDIR      Mask = syscall.IN_ISDIR
 	IN_IGNORED    Mask = syscall.IN_IGNORED
 	IN_Q_OVERFLOW Mask = syscall.IN_Q_OVERFLOW
 	IN_UNMOUNT    Mask = syscall.IN_UNMOUNT
