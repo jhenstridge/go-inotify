@@ -8,12 +8,65 @@
 package inotify
 
 import (
-	"io/ioutil"
+	"errors"
 	"os"
-	"sync/atomic"
+	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
+
+type eventCollector struct {
+	watcher  *Watcher
+	expected int
+	events   []Event
+	done     chan struct{}
+}
+
+func collectEvents(watcher *Watcher, expected int) *eventCollector {
+	c := &eventCollector{
+		watcher:  watcher,
+		expected: expected,
+		done:     make(chan struct{}),
+	}
+	go c.watch()
+	return c
+}
+
+func (c *eventCollector) watch() {
+	defer func() { close(c.done) }()
+
+	timer := time.NewTimer(1 * time.Second)
+	defer timer.Stop()
+
+	for {
+		select {
+		case e, ok := <-c.watcher.Event:
+			if !ok {
+				return
+			}
+			c.events = append(c.events, e)
+			if len(c.events) >= c.expected {
+				return
+			}
+		case <-timer.C:
+			return
+		}
+	}
+}
+
+func (c *eventCollector) expect(t *testing.T, expected []Event) {
+	t.Helper()
+	<-c.done
+	if len(expected) != len(c.events) {
+		t.Fatalf("expected %d events, got %d events", len(expected), len(c.events))
+	}
+	for i := range c.events {
+		if expected[i] != c.events[i] {
+			t.Fatalf("Event %d differs:\n  expected: %s\n  actual: %s", i, expected[i], c.events[i])
+		}
+	}
+}
 
 func TestInotifyEvents(t *testing.T) {
 	// Create an inotify watcher instance and initialize it
@@ -22,11 +75,7 @@ func TestInotifyEvents(t *testing.T) {
 		t.Fatalf("NewWatcher failed: %s", err)
 	}
 
-	dir, err := ioutil.TempDir("", "inotify")
-	if err != nil {
-		t.Fatalf("TempDir failed: %s", err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	// Add a watch for "_test"
 	watch, err := watcher.Watch(dir)
@@ -37,37 +86,23 @@ func TestInotifyEvents(t *testing.T) {
 		t.Fatalf("Watch returned a nil watch")
 	}
 
-	testFile := dir + "/TestInotifyEvents.testfile"
+	const testFile = "TestInotifyEvents.testfile"
 
-	// Receive events on the event channel on a separate goroutine
-	eventstream := watcher.Event
-	var eventsReceived int32 = 0
-	done := make(chan bool)
-	go func() {
-		for event := range eventstream {
-			// Only count relevant events
-			if event.Watch == watch && event.Name == "TestInotifyEvents.testfile" {
-				atomic.AddInt32(&eventsReceived, 1)
-				t.Logf("event received: %s", event)
-			} else {
-				t.Logf("unexpected event received: %s", event)
-			}
-		}
-		done <- true
-	}()
+	events := collectEvents(watcher, 3)
 
 	// Create a file
 	// This should add at least one event to the inotify event queue
-	_, err = os.OpenFile(testFile, os.O_WRONLY|os.O_CREATE, 0666)
+	f, err := os.OpenFile(filepath.Join(dir, testFile), os.O_WRONLY|os.O_CREATE, 0666)
 	if err != nil {
 		t.Fatalf("creating test file: %s", err)
 	}
+	f.Close()
 
-	// We expect this event to be received almost immediately, but let's wait 1 s to be sure
-	time.Sleep(1 * time.Second)
-	if atomic.AddInt32(&eventsReceived, 0) == 0 {
-		t.Fatal("inotify event hasn't been received after 1 second")
-	}
+	events.expect(t, []Event{
+		{watch, IN_CREATE, 0, testFile},
+		{watch, IN_OPEN, 0, testFile},
+		{watch, IN_CLOSE_WRITE, 0, testFile},
+	})
 
 	// Try closing the inotify instance
 	t.Log("calling Close()")
@@ -77,7 +112,7 @@ func TestInotifyEvents(t *testing.T) {
 	}
 	t.Log("waiting for the event channel to become closed...")
 	select {
-	case <-done:
+	case <-watcher.Event:
 		t.Log("event channel closed")
 	case <-time.After(1 * time.Second):
 		t.Fatal("event stream was not closed after 1 second")
@@ -86,7 +121,10 @@ func TestInotifyEvents(t *testing.T) {
 
 func TestInotifyClose(t *testing.T) {
 	watcher, _ := NewWatcher()
-	watcher.Close()
+	err := watcher.Close()
+	if err != nil {
+		t.Fatalf("error closing watcher: %s", err)
+	}
 
 	done := make(chan bool)
 	go func() {
@@ -100,8 +138,98 @@ func TestInotifyClose(t *testing.T) {
 		t.Fatal("double Close() test failed: second Close() call didn't return")
 	}
 
-	_, err := watcher.Watch(os.TempDir())
+	dir := t.TempDir()
+	_, err = watcher.Watch(dir)
 	if err == nil {
 		t.Fatal("expected error on Watch() after Close(), got nil")
 	}
+}
+
+func TestInotifyMaskCreate(t *testing.T) {
+	watcher, err := NewWatcher()
+	if err != nil {
+		t.Fatalf("error creating watcher: %s", err)
+	}
+	defer watcher.Close()
+
+	dir := t.TempDir()
+	_, err = watcher.AddWatch(dir, IN_CLOSE_WRITE)
+	if err != nil {
+		t.Fatalf("error creating watch: %s", err)
+	}
+
+	_, err = watcher.AddWatch(dir, IN_MASK_CREATE|IN_OPEN)
+	if !errors.Is(err, syscall.EEXIST) {
+		t.Fatalf("expected EEXIST error, got: %s", err)
+	}
+}
+
+func TestInotifyMaskAdd(t *testing.T) {
+	watcher, err := NewWatcher()
+	if err != nil {
+		t.Fatalf("error creating watcher: %s", err)
+	}
+	defer watcher.Close()
+	events := collectEvents(watcher, 2)
+
+	dir := t.TempDir()
+	watch1, err := watcher.AddWatch(dir, IN_OPEN)
+	if err != nil {
+		t.Fatalf("error creating watch: %s", err)
+	}
+	watch2, err := watcher.AddWatch(dir, IN_MASK_ADD|IN_CLOSE_WRITE)
+	if err != nil {
+		t.Fatalf("error creating watch: %s", err)
+	}
+	if watch1 != watch2 {
+		t.Fatalf("AddWatch calls returned different watches: %#v != %#v", watch1, watch2)
+	}
+
+	const testFile = "TestInotifyEvents.testfile"
+	f, err := os.OpenFile(filepath.Join(dir, testFile), os.O_WRONLY|os.O_CREATE, 0666)
+	if err != nil {
+		t.Fatalf("creating test file: %s", err)
+	}
+	f.Close()
+
+	// Both events are delivered
+	events.expect(t, []Event{
+		{watch1, IN_OPEN, 0, testFile},
+		{watch1, IN_CLOSE_WRITE, 0, testFile},
+	})
+}
+
+func TestInotifyMaskReplace(t *testing.T) {
+	watcher, err := NewWatcher()
+	if err != nil {
+		t.Fatalf("error creating watcher: %s", err)
+	}
+	defer watcher.Close()
+	events := collectEvents(watcher, 2)
+
+	dir := t.TempDir()
+	watch1, err := watcher.AddWatch(dir, IN_OPEN)
+	if err != nil {
+		t.Fatalf("error creating watch: %s", err)
+	}
+	watch2, err := watcher.AddWatch(dir, IN_CREATE|IN_CLOSE_WRITE)
+	if err != nil {
+		t.Fatalf("error creating watch: %s", err)
+	}
+	if watch1 != watch2 {
+		t.Fatalf("AddWatch calls returned different watches: %#v != %#v", watch1, watch2)
+	}
+
+	const testFile = "TestInotifyEvents.testfile"
+	f, err := os.OpenFile(filepath.Join(dir, testFile), os.O_WRONLY|os.O_CREATE, 0666)
+	if err != nil {
+		t.Fatalf("creating test file: %s", err)
+	}
+	f.Close()
+
+	// The IN_OPEN event is not delivered, since the mask was replaced
+	events.expect(t, []Event{
+		{watch1, IN_CREATE, 0, testFile},
+		{watch1, IN_CLOSE_WRITE, 0, testFile},
+	})
 }
