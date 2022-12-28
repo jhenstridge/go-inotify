@@ -48,9 +48,10 @@ type Event struct {
 type Watch struct {
 	wd   int32  // Watch descriptor (as returned by the inotify_add_watch() syscall)
 	Mask Mask   // inotify flags of this watch (see inotify(7) for the list of valid flags)
-	Path string // the path associated with this watch
+	Path string // the path associated with this watch at the time it was created
 }
 
+// Mask represents a set of flags associated with an inotify watch or event
 type Mask uint32
 
 type Watcher struct {
@@ -84,8 +85,7 @@ func NewWatcher() (*Watcher, error) {
 }
 
 // Close closes an inotify watcher instance
-// It sends a message to the reader goroutine to quit and removes all watches
-// associated with the inotify instance
+// It sends a message to the reader goroutine to quit.
 func (w *Watcher) Close() error {
 	w.mu.Lock()
 	if !w.isClosed {
@@ -105,11 +105,10 @@ func (w *Watcher) Close() error {
 // If a watch already exists for the path's inode, a number of things
 // could happen:
 //
-//   1. If the mask includes IN_MASK_CREATE, an error will be returned.
-//   2. If the mask includes IN_MASK_ADD, the new mask bits will be
-//      combined with the old.
-//   3. Otherwise, the old mask will be replaced with the new one.
-
+//  1. If the mask includes IN_MASK_CREATE, an error will be returned.
+//  2. If the mask includes IN_MASK_ADD, the new mask bits will be
+//     combined with the old.
+//  3. Otherwise, the old mask will be replaced with the new one.
 func (w *Watcher) AddWatch(path string, mask Mask) (*Watch, error) {
 	w.mu.Lock() // synchronize with readEvents goroutine
 	defer w.mu.Unlock()
@@ -179,6 +178,7 @@ func (w *Watcher) RemoveWatch(watch *Watch) error {
 	return nil
 }
 
+// decodeEvents decodes a buffer of InotifyEvents into slice of Event structs
 func (w *Watcher) decodeEvents(events []Event, buf []byte) []Event {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -254,7 +254,7 @@ func (w *Watcher) readEvents() {
 }
 
 // String formats the event e in the form
-// "filename: 0xEventMask = IN_ACCESS|IN_ATTRIB_|..."
+// "path=filename mask=0xEventMask (IN_ACCESS|IN_ATTRIB|...) name=..."
 func (e Event) String() string {
 	var path string
 	if e.Watch != nil {
@@ -263,6 +263,7 @@ func (e Event) String() string {
 	return fmt.Sprintf("path=%q mask=%#x (%s) name=%q", path, uint32(e.Mask), e.Mask, e.Name)
 }
 
+// String formats a mask in the form "IN_ACCESS|IN_ATTRIB|..."
 func (m Mask) String() string {
 	events := ""
 	for _, b := range eventBits {
@@ -281,10 +282,6 @@ func (m Mask) String() string {
 }
 
 const (
-	// Options for inotify_init() are not exported
-	// IN_CLOEXEC    Mask = syscall.IN_CLOEXEC
-	// IN_NONBLOCK   Mask = syscall.IN_NONBLOCK
-
 	// Options for AddWatch
 	IN_DONT_FOLLOW Mask = syscall.IN_DONT_FOLLOW
 	IN_EXCL_UNLINK Mask = syscall.IN_EXCL_UNLINK
@@ -322,21 +319,25 @@ var eventBits = []struct {
 	Name  string
 }{
 	{IN_ACCESS, "IN_ACCESS"},
+	{IN_MODIFY, "IN_MODIFY"},
 	{IN_ATTRIB, "IN_ATTRIB"},
-	{IN_CLOSE, "IN_CLOSE"},
-	{IN_CLOSE_NOWRITE, "IN_CLOSE_NOWRITE"},
 	{IN_CLOSE_WRITE, "IN_CLOSE_WRITE"},
+	{IN_CLOSE_NOWRITE, "IN_CLOSE_NOWRITE"},
+	{IN_OPEN, "IN_OPEN"},
+	{IN_MOVED_FROM, "IN_MOVED_FROM"},
+	{IN_MOVED_TO, "IN_MOVED_TO"},
 	{IN_CREATE, "IN_CREATE"},
 	{IN_DELETE, "IN_DELETE"},
 	{IN_DELETE_SELF, "IN_DELETE_SELF"},
-	{IN_MODIFY, "IN_MODIFY"},
-	{IN_MOVE, "IN_MOVE"},
-	{IN_MOVED_FROM, "IN_MOVED_FROM"},
-	{IN_MOVED_TO, "IN_MOVED_TO"},
 	{IN_MOVE_SELF, "IN_MOVE_SELF"},
-	{IN_OPEN, "IN_OPEN"},
-	{IN_ISDIR, "IN_ISDIR"},
-	{IN_IGNORED, "IN_IGNORED"},
-	{IN_Q_OVERFLOW, "IN_Q_OVERFLOW"},
 	{IN_UNMOUNT, "IN_UNMOUNT"},
+	{IN_Q_OVERFLOW, "IN_Q_OVERFLOW"},
+	{IN_IGNORED, "IN_IGNORED"},
+	{IN_ONLYDIR, "IN_ONLYDIR"},
+	{IN_DONT_FOLLOW, "IN_DONT_FOLLOW"},
+	{IN_EXCL_UNLINK, "IN_EXCL_UNLINK"},
+	{IN_MASK_CREATE, "IN_MASK_CREATE"},
+	{IN_MASK_ADD, "IN_MASK_ADD"},
+	{IN_ISDIR, "IN_ISDIR"},
+	{IN_ONESHOT, "IN_ONESHOT"},
 }
