@@ -171,6 +171,10 @@ func (w *Watcher) RemoveWatch(watch *Watch) error {
 	// pending events might still reference it. Instead, we give
 	// it an invalid watch ID so we can catch attempts to remove
 	// it twice.
+	//
+	// Watch descriptors are allocated sequentially, so it is
+	// unlikely that it will be reused before the IN_IGNORED event
+	// arrives.
 	watch.wd = -1
 	return nil
 }
