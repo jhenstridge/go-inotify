@@ -8,9 +8,10 @@ problems:
    single inode could have multiple file paths, or change its file
    path between when it is watched and when events are generated.
 
-2. `AddWatch` now returns an `*Watch` representing the watch
-   descriptor. For convenience, the watch stores the path it was
-   created for.
+2. `AddWatch` now returns a `*Watch` representing the watch
+   descriptor. Watches can be compared by pointer equality, as only
+   one watch struct will be used for each watch descriptor. For
+   convenience, the watch stores the path it was created for.
 
 3. There is no attempt to automatically use `IN_MASK_ADD`. The
    previous behaviour was unreliable, so you'll need to specify it
