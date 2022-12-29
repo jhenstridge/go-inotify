@@ -92,7 +92,7 @@ func TestInotifyEvents(t *testing.T) {
 
 	// Create a file
 	// This should add at least one event to the inotify event queue
-	f, err := os.OpenFile(filepath.Join(dir, testFile), os.O_WRONLY|os.O_CREATE, 0666)
+	f, err := os.OpenFile(filepath.Join(dir, testFile), os.O_WRONLY|os.O_CREATE, 0o666)
 	if err != nil {
 		t.Fatalf("creating test file: %s", err)
 	}
@@ -186,7 +186,7 @@ func TestInotifyMaskAdd(t *testing.T) {
 	}
 
 	const testFile = "TestInotifyEvents.testfile"
-	f, err := os.OpenFile(filepath.Join(dir, testFile), os.O_WRONLY|os.O_CREATE, 0666)
+	f, err := os.OpenFile(filepath.Join(dir, testFile), os.O_WRONLY|os.O_CREATE, 0o666)
 	if err != nil {
 		t.Fatalf("creating test file: %s", err)
 	}
@@ -221,7 +221,7 @@ func TestInotifyMaskReplace(t *testing.T) {
 	}
 
 	const testFile = "TestInotifyEvents.testfile"
-	f, err := os.OpenFile(filepath.Join(dir, testFile), os.O_WRONLY|os.O_CREATE, 0666)
+	f, err := os.OpenFile(filepath.Join(dir, testFile), os.O_WRONLY|os.O_CREATE, 0o666)
 	if err != nil {
 		t.Fatalf("creating test file: %s", err)
 	}
@@ -232,4 +232,35 @@ func TestInotifyMaskReplace(t *testing.T) {
 		{watch1, IN_CREATE, 0, testFile},
 		{watch1, IN_CLOSE_WRITE, 0, testFile},
 	})
+}
+
+func TestInotifyWatchRemovedOnDelete(t *testing.T) {
+	watcher, err := NewWatcher()
+	if err != nil {
+		t.Fatalf("error creating watcher: %s", err)
+	}
+	defer watcher.Close()
+	events := collectEvents(watcher, 2)
+
+	dir := t.TempDir()
+	subdir := filepath.Join(dir, "subdir")
+	if err := os.Mkdir(subdir, 0o755); err != nil {
+		t.Fatalf("error creating subdir: %s", err)
+	}
+	watch, err := watcher.AddWatch(subdir, IN_DELETE_SELF)
+	if err != nil {
+		t.Fatalf("error creating watch: %s", err)
+	}
+
+	if err := os.Remove(subdir); err != nil {
+		t.Fatalf("error removing subdir: %s", err)
+	}
+	events.expect(t, []Event{
+		{watch, IN_DELETE_SELF, 0, ""},
+		{watch, IN_IGNORED, 0, ""},
+	})
+	// The watcher has now forgotten about the watch
+	if len(watcher.watches) != 0 {
+		t.Fatalf("watch map is not empty: %#v", watcher.watches)
+	}
 }
